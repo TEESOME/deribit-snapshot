@@ -1,0 +1,27 @@
+name: deribit-daily-snapshot
+
+on:
+  schedule:
+    - cron: "17 7 * * *"   # ทุกวัน 07:17 UTC = 14:17 เวลาไทย (ก่อน settle 15:00)
+  workflow_dispatch:         # กดรันเองได้จากแท็บ Actions
+
+permissions:
+  contents: write
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Take snapshot
+        run: python snapshot.py
+      - name: Commit data
+        run: |
+          git config user.name "snapshot-bot"
+          git config user.email "snapshot-bot@users.noreply.github.com"
+          git add data
+          git commit -m "snapshot $(date -u +%F)" || echo "nothing to commit"
+          git push
