@@ -2,11 +2,15 @@ name: deribit-daily-snapshot
 
 on:
   schedule:
-    - cron: "17 7 * * *"   # ทุกวัน 07:17 UTC = 14:17 เวลาไทย (ก่อน settle 15:00)
-  workflow_dispatch:         # กดรันเองได้จากแท็บ Actions
+    - cron: "17 7 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
 
 jobs:
   snapshot:
@@ -23,5 +27,6 @@ jobs:
           git config user.name "snapshot-bot"
           git config user.email "snapshot-bot@users.noreply.github.com"
           git add data
-          git commit -m "snapshot $(date -u +%F)" || echo "nothing to commit"
+          git commit -m "snapshot $(date -u +%F)" || exit 0
+          git pull --rebase
           git push
