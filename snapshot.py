@@ -277,3 +277,99 @@ try:
     longvol_signal(chain, now)
 except BaseException as e:          # ห้ามทำให้ snapshot หลักล้ม
     print("longvol_signal failed:", repr(e))
+
+# ---------- trend grid signal: Adaptive Grid + EMA12/26 + SMA200 (เพิ่ม 20 พ.ย. 2026) ----------
+# บันทึก:
+#   data/grid_signal.csv          — 1 แถวต่อวัน
+#   data/grid_signal_latest.json  — ค่าล่าสุดสำหรับ scheduled task
+# ใช้ราคาปิดรายวัน BTCUSDT ของ Binance (แท่ง 00:00 UTC ที่ปิดแล้ว) ให้ตรงกับ backtest; ถ้าดึงไม่ได้ใช้ BTC-PERPETUAL ของ Deribit แทน
+# กฎ (protocol กลยุทธ์ตาม trend): เปิด grid เมื่อ EMA12 > EMA26 และราคาปิด > SMA200; EMA ตัดลงขณะเหนือ SMA200 → cut ทุกไม้;
+#   ราคาปิดหลุด SMA200 → หยุดซื้อ ถือไม้ไว้ (แช่ไม้); ระยะขั้น 1.5 × ATR14, ซื้อทันที 5 ไม้ + ตั้งด้านล่าง 5 ไม้
+# สถานะ (mode) จำลองจากสัญญาณรายวันอย่างเดียว: off / grid / frozen — ไม่รู้ว่าไม้ที่แช่ขายหมดแล้วหรือยัง (T เช็กเองจากพอร์ต)
+GRID_ATR_MULT = 1.5
+GRID_LOT_USD = 1000
+
+def _binance_daily():
+    import urllib.request as _u
+    for host in ("https://data-api.binance.vision", "https://api.binance.com"):
+        try:
+            with _u.urlopen(f"{host}/api/v3/klines?symbol=BTCUSDT&interval=1d&limit=1000", timeout=60) as r:
+                k = json.loads(r.read())
+            return [(int(x[0]), float(x[2]), float(x[3]), float(x[4])) for x in k], "binance_btcusdt"
+        except Exception as e:
+            print("grid_signal: binance", host, repr(e))
+    return None, None
+
+def grid_signal(now):
+    today0 = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp() * 1000)
+    bars, src = _binance_daily()
+    if not bars:
+        end_ms = int(now.timestamp() * 1000); start_ms = end_ms - 1000 * 86400 * 1000
+        tv = get("https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
+                 f"?instrument_name=BTC-PERPETUAL&resolution=1D&start_timestamp={start_ms}&end_timestamp={end_ms}")
+        bars = list(zip(tv["ticks"], tv["high"], tv["low"], tv["close"])); src = "deribit_perp"
+    bars = [b for b in bars if b[0] < today0]                     # เฉพาะแท่งที่ปิดแล้ว
+    if len(bars) < 260:
+        print("grid_signal: daily bars", len(bars), "< 260"); return
+    t = [b[0] for b in bars]; h = [b[1] for b in bars]; l = [b[2] for b in bars]; c = [b[3] for b in bars]
+    def ema(xs, n):
+        a = 2 / (n + 1); out = [xs[0]]
+        for x in xs[1:]: out.append(a * x + (1 - a) * out[-1])
+        return out
+    e12 = ema(c, 12); e26 = ema(c, 26)
+    tr = [h[0] - l[0]] + [max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1])) for i in range(1, len(c))]
+    atr = [tr[0]]
+    for x in tr[1:]: atr.append(atr[-1] + (x - atr[-1]) / 14)  # Wilder (ewm alpha 1/14) เหมือน backtest
+    sma = [None] * len(c)
+    for i in range(199, len(c)): sma[i] = sum(c[i - 199:i + 1]) / 200
+    # จำลองสถานะรายวันตามกฎ (เริ่มเมื่อมี SMA200)
+    mode = "off"; modes = [None] * len(c); events = [""] * len(c)
+    for i in range(200, len(c)):
+        up = e12[i] > e26[i]; up_prev = e12[i - 1] > e26[i - 1]
+        above = c[i] > sma[i]; ok = up and above; ev = ""
+        if mode == "grid":
+            if not above: mode = "frozen"; ev = "FREEZE"
+            elif up_prev and not up: mode = "off"; ev = "CUT"
+        if mode in ("off", "frozen") and ok:
+            ev = "ENTER" if mode == "off" else "REENTER"; mode = "grid"
+        modes[i] = mode; events[i] = ev
+    i = len(c) - 1
+    up = e12[i] > e26[i]; up_prev = e12[i - 1] > e26[i - 1]
+    cross = "CROSS_UP" if up and not up_prev else ("CROSS_DOWN" if up_prev and not up else "")
+    above_prev = c[i - 1] > sma[i - 1]; above = c[i] > sma[i]
+    sma_cross = "CROSS_UP" if above and not above_prev else ("CROSS_DOWN" if above_prev and not above else "")
+    ev = events[i]
+    action = {"ENTER": "เข้า grid ได้แล้ว: ซื้อทันที 5 ไม้ + ตั้ง buy limit 5 ไม้",
+              "REENTER": "กลับมาเปิด grid: ไม้ว่าง = 10 − ไม้ค้าง → ซื้อทันทีครึ่งหนึ่ง (ปัดลง) ที่เหลือตั้งด้านล่าง",
+              "CUT": "cut loss ทุกไม้ (EMA12 ตัดลงใต้ EMA26 ขณะราคาเหนือ SMA200) แล้วยกเลิกคำสั่งทั้งหมด",
+              "FREEZE": "หยุดซื้อ / แช่ไม้: ยกเลิก buy limit ถือไม้ที่มี คงคำสั่งขายเดิม"}.get(ev) or \
+             {"grid": "grid ทำงานต่อ ไม่ต้องทำอะไร",
+              "frozen": "แช่ไม้ต่อ (ราคาใต้ SMA200) ไม่ซื้อเพิ่ม; EMA ตัดลงไม่ต้องทำอะไร",
+              "off": "ถือเงินสด รอ EMA12 > EMA26 และราคาปิด > SMA200"}[modes[i]]
+    since = i
+    while since > 200 and modes[since - 1] == modes[i]: since -= 1
+    step = GRID_ATR_MULT * atr[i]; px = c[i]
+    day = datetime.fromtimestamp(t[i] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    row = dict(date=now.strftime("%Y-%m-%d"), time_utc=now.strftime("%H:%M"), bar_date=day, source=src,
+               close=round(px, 1), ema12=round(e12[i], 1), ema26=round(e26[i], 1),
+               ema_gap_pct=round((e12[i] / e26[i] - 1) * 100, 2), ema_cross=cross,
+               sma200=round(sma[i], 1), sma200_dist_pct=round((px / sma[i] - 1) * 100, 2), sma200_cross=sma_cross,
+               atr14=round(atr[i], 1), step=round(step, 1), mode=modes[i],
+               mode_since=datetime.fromtimestamp(t[since] / 1000, tz=timezone.utc).strftime("%Y-%m-%d"),
+               event=ev, action=action,
+               grid_sells="|".join(str(round(px + k * step)) for k in range(1, 6)),
+               grid_buys="|".join(str(round(px - k * step)) for k in range(1, 6)))
+    new = not os.path.exists("data/grid_signal.csv")
+    with open("data/grid_signal.csv", "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row))
+        if new: w.writeheader()
+        w.writerow(row)
+    with open("data/grid_signal_latest.json", "w") as f:
+        json.dump(dict(updated_utc=now.strftime("%Y-%m-%d %H:%M"), **row), f, ensure_ascii=False, indent=1)
+    print(f"grid_signal [{src}] {day}: close {px:,.0f} EMA12 {e12[i]:,.0f} / EMA26 {e26[i]:,.0f} {cross} | "
+          f"SMA200 {sma[i]:,.0f} ({row['sma200_dist_pct']:+.1f}%) | mode {modes[i]} {ev} → {action}")
+
+try:
+    grid_signal(now)
+except BaseException as e:          # ห้ามทำให้ snapshot หลักล้ม
+    print("grid_signal failed:", repr(e))
