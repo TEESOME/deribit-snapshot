@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: main
+          ref: main          # ใช้ main ล่าสุดตอนเริ่ม job (ไม่ใช้ commit ตอนกดรัน) กันชนกับ run อื่นที่ commit ไปก่อน
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
