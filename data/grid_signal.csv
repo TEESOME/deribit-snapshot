@@ -1,0 +1,2 @@
+date,time_utc,bar_date,source,close,ema12,ema26,ema_gap_pct,ema_cross,sma200,sma200_dist_pct,sma200_cross,atr14,step,mode,mode_since,event,action,grid_sells,grid_buys
+2026-11-20,16:51,2026-11-19,binance_btcusdt,61986.7,67681.3,72113.7,-6.15,,72693.7,-14.73,,2642.3,3963.5,off,2026-10-23,,ถือเงินสด รอ EMA12 > EMA26 และราคาปิด > SMA200,65950|69914|73877|77841|81804,58023|54060|50096|46133|42169
