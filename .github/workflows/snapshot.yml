@@ -2,7 +2,7 @@ name: deribit-daily-snapshot
 
 on:
   schedule:
-    - cron: "17 7 * * *"
+    - cron: "17 9 * * *"     # สำรองเท่านั้น (GitHub มักเลื่อน 5–10 ชม.) — รอบหลักสั่งจาก n8n ผ่าน workflow_dispatch
   workflow_dispatch:
 
 permissions:
@@ -18,12 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v5
         with:
-          ref: main          # ใช้ main ล่าสุดตอนเริ่ม job (ไม่ใช้ commit ตอนกดรัน) กันชนกับ run อื่นที่ commit ไปก่อน
+          ref: main
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Take snapshot
-        run: python snapshot.py
+        run: |
+          # รอบตาม cron ของ GitHub (มักช้าหลายชั่วโมง) เป็นแค่สำรอง: ถ้าวันนี้มีข้อมูลแล้ว (จาก n8n สั่งรันตรงเวลา) ให้ข้าม
+          if [ "${{ github.event_name }}" = "schedule" ] && [ -f "data/chain/$(date -u +%F).csv.gz" ]; then
+            echo "already have today's snapshot - skip scheduled backup run"; exit 0
+          fi
+          python snapshot.py
       - name: Commit data
         run: |
           git config user.name "snapshot-bot"
