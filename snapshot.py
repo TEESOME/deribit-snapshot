@@ -94,7 +94,7 @@ print(f"{now:%Y-%m-%d %H:%M} UTC: {len(chain)} instruments, {len(out)} expiries,
 #   data/weekly_signal_latest.json  — ค่าล่าสุดสำหรับให้ scheduled task อ่าน
 # กฎ (protocol ข้อ 2): ราคา ≥ SMA200 → ขาย put ≥ 2.5SD, ราคา < SMA200 → ≥ 3SD
 # 1SD = spot × ATM IV ของ expiry × √(วันที่เหลือถึง 08:00 UTC ของวันหมดอายุ / 365); put ปัดลงเป็น strike ที่มีจริง
-C_USD = 11000          # เงินกองทุน C
+C_USD = 9500           # เงินกองทุน C (ปรับ 21 พ.ย. 2026; เดิม 11,000)
 CAP_X = 4              # เพดาน 4×C
 NEAR_PCT = 3.0         # เตือน "ใกล้ตัด" ถ้าห่าง SMA200 ไม่ถึง 3%
 
@@ -182,7 +182,8 @@ try:
 except BaseException as e:          # ห้ามทำให้ snapshot หลักล้ม
     print("weekly_signal failed:", repr(e))
 
-# ---------- long vol signal: VRP / DVOL percentile + strangle ±0.5SD ~60 วัน (เพิ่ม 19 พ.ย. 2026) ----------
+# ---------- long vol signal: VRP / DVOL percentile + straddle ATM ~60 วัน (เพิ่ม 19 พ.ย. 2026; เปลี่ยนเป็น straddle 21 พ.ย. 2026) ----------
+# ค่า strangle ±0.5SD ยังบันทึกไว้เทียบ (call_strike/put_strike/strangle_usd_per_btc); กฎใช้ straddle_*
 # บันทึก:
 #   data/longvol_signal.csv     — 1 แถวต่อวัน
 #   data/longvol_latest.json    — ค่าล่าสุดสำหรับ scheduled task
@@ -263,15 +264,33 @@ def longvol_signal(chain, now):
             with open("data/longvol_latest.json") as f: prev = json.load(f).get("signal", "")
         except Exception: pass
     row["new_signal"] = int(bool(signal) and not prev)
-    new = not os.path.exists("data/longvol_signal.csv")
-    with open("data/longvol_signal.csv", "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(row))
-        if new: w.writeheader()
-        w.writerow(row)
+    # straddle ATM (กฎปัจจุบัน): strike ที่ใกล้ forward ที่สุดที่มีทั้ง call และ put
+    row.update(straddle_strike="", straddle_call_usd="", straddle_put_usd="", straddle_usd_per_btc="",
+               straddle_be_low="", straddle_be_high="", straddle_btc_1pctC="", straddle_btc_2pctC="")
+    if cands:
+        both = sorted(set(calls) & set(puts), key=lambda k: abs(k - fwd))
+        if both:
+            ks = both[0]; scm = calls[ks]["mark_price"] * spot; spm = puts[ks]["mark_price"] * spot; stt = scm + spm
+            row.update(straddle_strike=int(ks), straddle_call_usd=round(scm, 1), straddle_put_usd=round(spm, 1),
+                       straddle_usd_per_btc=round(stt, 1), straddle_be_low=round(ks - stt), straddle_be_high=round(ks + stt),
+                       straddle_btc_1pctC=round(LV_BUDGET[0] / stt, 4), straddle_btc_2pctC=round(LV_BUDGET[1] / stt, 4))
+    path = "data/longvol_signal.csv"
+    if os.path.exists(path):
+        with open(path, newline="") as f: rd = csv.DictReader(f); old_fields = rd.fieldnames or []; old_rows = list(rd)
+        if old_fields != list(row):                     # คอลัมน์เปลี่ยน → เขียนไฟล์ใหม่ด้วยหัวตารางรวม
+            fields = old_fields + [k for k in row if k not in old_fields]
+            with open(path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(old_rows)
+        else: fields = old_fields
+    else:
+        fields = list(row)
+        with open(path, "w", newline="") as f: csv.DictWriter(f, fieldnames=fields).writeheader()
+    with open(path, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=fields).writerow(row)
     with open("data/longvol_latest.json", "w") as f:
         json.dump(dict(updated_utc=now.strftime("%Y-%m-%d %H:%M"), **row), f, ensure_ascii=False, indent=1)
     print(f"longvol_signal: DVOL {dvol:.1f} (pct {pct:.0%}) RV {rv*100:.1f} VRP {vrp:.2f} → {signal or 'no signal'}; "
-          f"{row['expiry']} C{row['call_strike']} / P{row['put_strike']} ≈ {row['strangle_usd_per_btc']} USD/BTC")
+          f"{row['expiry']} straddle {row['straddle_strike']} ≈ {row['straddle_usd_per_btc']} USD/BTC")
 
 try:
     longvol_signal(chain, now)
