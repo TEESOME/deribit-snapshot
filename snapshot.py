@@ -94,8 +94,8 @@ print(f"{now:%Y-%m-%d %H:%M} UTC: {len(chain)} instruments, {len(out)} expiries,
 #   data/weekly_signal_latest.json  — ค่าล่าสุดสำหรับให้ scheduled task อ่าน
 # กฎ (protocol ข้อ 2): ราคา ≥ SMA200 → ขาย put ≥ 2.5SD, ราคา < SMA200 → ≥ 3SD
 # 1SD = spot × ATM IV ของ expiry × √(วันที่เหลือถึง 08:00 UTC ของวันหมดอายุ / 365); put ปัดลงเป็น strike ที่มีจริง
-C_USD = 9500           # เงินกองทุน C (ปรับ 21 พ.ย. 2026; เดิม 11,000)
-CAP_X = 4              # เพดาน 4×C
+C_USD = 15000          # C = ทุน option หลัก + long vol (28 พ.ย. 2026; A = 20,000 รวม, B = 5,000 grid; เดิม 9,500)
+CAP_X = 4              # เพดานสูงสุด 4×C (DVOL pct > 30%; ≤ 30% → 2×C)
 NEAR_PCT = 3.0         # เตือน "ใกล้ตัด" ถ้าห่าง SMA200 ไม่ถึง 3%
 
 def weekly_signal(chain, now):
@@ -306,7 +306,7 @@ except BaseException as e:          # ห้ามทำให้ snapshot ห�
 #   ราคาปิดหลุด SMA200 → หยุดซื้อ ถือไม้ไว้ (แช่ไม้); ระยะขั้น 1.5 × ATR14, ซื้อทันที 5 ไม้ + ตั้งด้านล่าง 5 ไม้
 # สถานะ (mode) จำลองจากสัญญาณรายวันอย่างเดียว: off / grid / frozen — ไม่รู้ว่าไม้ที่แช่ขายหมดแล้วหรือยัง (T เช็กเองจากพอร์ต)
 GRID_ATR_MULT = 1.5
-GRID_LOT_USD = 1000
+GRID_LOT_USD = 500     # B = 5,000 ÷ 10 ไม้ (28 พ.ย. 2026; เดิม 1,000)
 
 def _binance_daily():
     import urllib.request as _u
@@ -392,3 +392,53 @@ try:
     grid_signal(now)
 except BaseException as e:          # ห้ามทำให้ snapshot หลักล้ม
     print("grid_signal failed:", repr(e))
+
+# ---------- TSMOM 28d + ตัวกรอง ER (เพิ่ม 28 พ.ย. 2026) ----------
+# บันทึก data/tsmom_signal.csv (1 แถวต่อวัน) + data/tsmom_latest.json
+# กฎ (protocol พอร์ต C): ทุกวันอาทิตย์ ~15:00 ไทย ใช้ราคาปิดรายวันแท่งล่าสุดที่ปิดแล้ว (วันเสาร์)
+#   ER28 = |close − close 28 วันก่อน| ÷ ผลรวม |เปลี่ยนรายวัน| 28 วัน; ER28 > 0.3 → ถือ perp ตามทิศ ret28 (+ long / − short)
+#   ขนาด notional = 0.15 × C × min(1, 0.5 ÷ RV30) (RV30 = std ผลตอบแทนรายวัน 30 วัน × √365); ER ≤ 0.3 → ไม่ถือ (ปิด)
+TS_K = 0.15; TS_VOL_TGT = 0.5; TS_ER_MIN = 0.3
+
+def tsmom_signal(now):
+    import math
+    today0 = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp() * 1000)
+    bars, src = _binance_daily()
+    if not bars:
+        end_ms = int(now.timestamp() * 1000); start_ms = end_ms - 200 * 86400 * 1000
+        tv = get("https://www.deribit.com/api/v2/public/get_tradingview_chart_data"
+                 f"?instrument_name=BTC-PERPETUAL&resolution=1D&start_timestamp={start_ms}&end_timestamp={end_ms}")
+        bars = list(zip(tv["ticks"], tv["high"], tv["low"], tv["close"])); src = "deribit_perp"
+    bars = [b for b in bars if b[0] < today0]
+    c = [b[3] for b in bars]
+    if len(c) < 40:
+        print("tsmom_signal: bars", len(c)); return
+    ret28 = c[-1] / c[-29] - 1
+    er = abs(c[-1] - c[-29]) / sum(abs(c[i] - c[i - 1]) for i in range(len(c) - 28, len(c)))
+    rr = [c[i] / c[i - 1] - 1 for i in range(len(c) - 30, len(c))]
+    m = sum(rr) / len(rr); rv = math.sqrt(sum((x - m) ** 2 for x in rr) / (len(rr) - 1)) * math.sqrt(365)
+    lev = min(1.0, TS_VOL_TGT / rv) if rv > 0 else 1.0
+    on = er > TS_ER_MIN
+    d = (1 if ret28 > 0 else -1) if on else 0
+    notional = d * TS_K * C_USD * lev
+    bar_day = datetime.fromtimestamp(bars[-1][0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+    row = dict(date=now.strftime("%Y-%m-%d"), time_utc=now.strftime("%H:%M"), bar_date=bar_day, source=src,
+               close=round(c[-1], 1), ret28_pct=round(ret28 * 100, 2), er28=round(er, 3), er_min=TS_ER_MIN,
+               rv30_pct=round(rv * 100, 1), vol_scale=round(lev, 3), signal="ON" if on else "OFF",
+               direction={1: "LONG", -1: "SHORT", 0: "FLAT"}[d], target_notional_usd=round(notional, 0),
+               target_btc=round(notional / c[-1], 4), c_usd=C_USD, k=TS_K,
+               rebalance_day=int(now.weekday() == 6))
+    new = not os.path.exists("data/tsmom_signal.csv")
+    with open("data/tsmom_signal.csv", "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(row))
+        if new: w.writeheader()
+        w.writerow(row)
+    with open("data/tsmom_latest.json", "w") as f:
+        json.dump(dict(updated_utc=now.strftime("%Y-%m-%d %H:%M"), **row), f, ensure_ascii=False, indent=1)
+    print(f"tsmom_signal [{src}] {bar_day}: ret28 {ret28*100:+.1f}% ER {er:.2f} RV30 {rv*100:.0f}% → {row['direction']} "
+          f"{notional:,.0f} USD ({row['target_btc']} BTC)")
+
+try:
+    tsmom_signal(now)
+except BaseException as e:
+    print("tsmom_signal failed:", repr(e))
