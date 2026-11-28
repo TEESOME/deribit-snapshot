@@ -93,10 +93,28 @@ print(f"{now:%Y-%m-%d %H:%M} UTC: {len(chain)} instruments, {len(out)} expiries,
 #   data/weekly_signal.csv          — 1 แถวต่อ expiry (weekly ศุกร์ 2 ตัวถัดไป) ต่อวัน
 #   data/weekly_signal_latest.json  — ค่าล่าสุดสำหรับให้ scheduled task อ่าน
 # กฎ (protocol ข้อ 2): ราคา ≥ SMA200 → ขาย put ≥ 2.5SD, ราคา < SMA200 → ≥ 3SD
+# (28 พ.ย. 2026) ถ้าไม่มี strike ไกลพอตามกฎ → ใช้ strike ต่ำสุดที่มี ถ้าห่าง ≥ 2.5SD (rule_source = lowest_2.5SD); ไม่งั้นข้าม (none)
 # 1SD = spot × ATM IV ของ expiry × √(วันที่เหลือถึง 08:00 UTC ของวันหมดอายุ / 365); put ปัดลงเป็น strike ที่มีจริง
 C_USD = 15000          # C = ทุน option หลัก + long vol (28 พ.ย. 2026; A = 20,000 รวม, B = 5,000 grid; เดิม 9,500)
 CAP_X = 4              # เพดานสูงสุด 4×C (DVOL pct > 30%; ≤ 30% → 2×C)
 NEAR_PCT = 3.0         # เตือน "ใกล้ตัด" ถ้าห่าง SMA200 ไม่ถึง 3%
+
+def _append_csv(path, rows):
+    # ต่อท้าย csv; ถ้าคอลัมน์เปลี่ยน (เพิ่มคอลัมน์ใหม่) เขียนไฟล์ใหม่ทั้งไฟล์ด้วย header ใหม่ ไม่ให้คอลัมน์เลื่อน
+    fields = list(rows[0])
+    if os.path.exists(path):
+        with open(path, newline="") as f:
+            rd = csv.DictReader(f); old_fields = rd.fieldnames or []; old = list(rd)
+        if old_fields != fields:
+            allf = old_fields + [k for k in fields if k not in old_fields]
+            with open(path, "w", newline="") as f:
+                w = csv.DictWriter(f, fieldnames=allf, extrasaction="ignore"); w.writeheader(); w.writerows(old); w.writerows(rows)
+            return
+        with open(path, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fields).writerows(rows)
+    else:
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows)
 
 def weekly_signal(chain, now):
     from datetime import timedelta
@@ -158,18 +176,21 @@ def weekly_signal(chain, now):
             r[f"put_{lab}"] = int(K) if K else ""
             mp = puts[K]["mark_price"] if K else None            # BTC ต่อ 1 สัญญา
             r[f"put_{lab}_mark_usd"] = round(mp * spot, 1) if mp is not None else ""
-        K_rule = put_at(spot - k_rule * sd)
+        K_rule = put_at(spot - k_rule * sd); src = "rule" if K_rule else "none"
+        if not K_rule and pk and pk[0] <= spot - 2.5 * sd:
+            K_rule = pk[0]; src = "lowest_2.5SD"
         r["rule_strike"] = int(K_rule) if K_rule else ""
+        r["rule_source"] = src
+        r["rule_sd_dist"] = round((spot - K_rule) / sd, 2) if K_rule else ""
+        r["lowest_put"] = int(pk[0]) if pk else ""
+        mp = puts[K_rule]["mark_price"] if K_rule else None
+        r["rule_mark_usd"] = round(mp * spot, 1) if mp is not None else ""
         r["rule_max_btc_4xC"] = round(CAP_X * C_USD / K_rule, 3) if K_rule else ""   # ก่อนหัก position ที่ถืออยู่
         rows.append(r)
     if not rows:
         print("weekly_signal: no weekly expiry found"); return
 
-    new = not os.path.exists("data/weekly_signal.csv")
-    with open("data/weekly_signal.csv", "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
-        if new: w.writeheader()
-        w.writerows(rows)
+    _append_csv("data/weekly_signal.csv", rows)
     with open("data/weekly_signal_latest.json", "w") as f:
         json.dump(dict(updated_utc=now.strftime("%Y-%m-%d %H:%M"), spot=round(spot, 1), sma200=round(sma200, 1),
                        dist_pct=round(dist, 2), mode=mode, prev_mode=prev_mode, alert=alert, expiries=rows),
