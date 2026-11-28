@@ -1,2 +1,3 @@
 date,time_utc,bar_date,source,close,ret28_pct,er28,er_min,rv30_pct,vol_scale,signal,direction,target_notional_usd,target_btc,c_usd,k,rebalance_day
 2026-11-28,08:27,2026-11-27,binance_btcusdt,59923.1,-22.55,0.472,0.3,46.2,1.0,ON,SHORT,-2250.0,-0.0375,15000,0.15,0
+2026-11-28,13:25,2026-11-27,binance_btcusdt,59923.1,-22.55,0.472,0.3,46.2,1.0,ON,SHORT,-2250.0,-0.0375,15000,0.15,0
