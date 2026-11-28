@@ -116,6 +116,33 @@ def _append_csv(path, rows):
         with open(path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fields); w.writeheader(); w.writerows(rows)
 
+def _bybit_puts():
+    # รายชื่อ put BTC บน Bybit (ที่ T เทรดจริง) → {expiry 'YYYY-MM-DD': {strike: dict(mark, bid, ask)}} (USD ต่อ 1 BTC)
+    # ใช้ API สาธารณะ ไม่ต้องใช้ key; ถ้าเรียกไม่ได้ (เช่นบล็อก IP สหรัฐฯ) คืน None แล้วใช้ Deribit แทน
+    import urllib.request as _u
+    for host in ("https://api.bybit.com", "https://api.bytick.com"):
+        try:
+            req = _u.Request(f"{host}/v5/market/tickers?category=option&baseCoin=BTC", headers={"User-Agent": "Mozilla/5.0"})
+            with _u.urlopen(req, timeout=60) as r:
+                js = json.loads(r.read())
+            lst = (js.get("result") or {}).get("list") or []
+            if not lst:
+                print("bybit:", host, "empty list", js.get("retMsg")); continue
+            usdt = any(x["symbol"].endswith("-USDT") for x in lst)
+            out = defaultdict(dict)
+            for x in lst:
+                parts = x["symbol"].split("-")
+                if len(parts) < 4 or parts[3] != "P": continue
+                if usdt and not x["symbol"].endswith("-USDT"): continue
+                exp = datetime.strptime(parts[1], "%d%b%y").strftime("%Y-%m-%d")
+                f = lambda k: float(x[k]) if x.get(k) not in (None, "") else None
+                out[exp][float(parts[2])] = dict(mark=f("markPrice"), bid=f("bid1Price"), ask=f("ask1Price"))
+            print(f"bybit: {host} puts {sum(len(v) for v in out.values())} in {len(out)} expiries")
+            return out
+        except Exception as e:
+            print("bybit:", host, repr(e))
+    return None
+
 def weekly_signal(chain, now):
     from datetime import timedelta
     # 1) ราคาปิดรายวันย้อนหลัง (BTC-PERPETUAL บน Deribit, แท่ง 00:00 UTC) → SMA200 ของแท่งที่ปิดแล้ว
@@ -146,7 +173,11 @@ def weekly_signal(chain, now):
     else:
         alert = ""
 
-    # 3) weekly ศุกร์ 2 ตัวถัดไป (เหลือ > 1 วัน) → ATM IV, SD, strike ที่มีจริง
+    # 3) weekly ศุกร์ 2 ตัวถัดไป (เหลือ > 1 วัน) → ATM IV, SD (Deribit), strike ที่มีจริง (Bybit ก่อน, ไม่ได้ → Deribit)
+    try:
+        BY = _bybit_puts()
+    except BaseException as e:
+        print("bybit failed:", repr(e)); BY = None
     by_exp = defaultdict(list)
     for c in chain: by_exp[c["expiry"]].append(c)
     fridays = sorted(e for e in by_exp
@@ -162,8 +193,14 @@ def weekly_signal(chain, now):
         ivs = [c["mark_iv"] for c in cs if c["strike"] == k_atm and c["mark_iv"]]
         atm_iv = sum(ivs) / len(ivs)
         sd = spot * atm_iv / 100 * math.sqrt(days / 365)
-        puts = {c["strike"]: c for c in cs if c["type"] == "P"}
-        pk = sorted(puts)
+        dputs = {c["strike"]: c for c in cs if c["type"] == "P"}
+        if BY and BY.get(exp):
+            strike_source = "bybit"; bp = BY[exp]
+            mark_usd = lambda K: bp[K]["mark"]; bid_usd = lambda K: bp[K]["bid"]; pk = sorted(bp)
+        else:
+            strike_source = "deribit"
+            mark_usd = lambda K: dputs[K]["mark_price"] * spot if dputs[K].get("mark_price") is not None else None
+            bid_usd = lambda K: (dputs[K].get("bid_price") or 0) * spot or None; pk = sorted(dputs)
         def put_at(level):            # strike ที่มีจริงสูงสุดที่ ≤ level
             ks = [k for k in pk if k <= level]
             return ks[-1] if ks else None
@@ -174,8 +211,8 @@ def weekly_signal(chain, now):
         for lab, k in (("2sd", 2.0), ("2_5sd", 2.5), ("3sd", 3.0)):
             K = put_at(spot - k * sd)
             r[f"put_{lab}"] = int(K) if K else ""
-            mp = puts[K]["mark_price"] if K else None            # BTC ต่อ 1 สัญญา
-            r[f"put_{lab}_mark_usd"] = round(mp * spot, 1) if mp is not None else ""
+            mp = mark_usd(K) if K else None                      # USD ต่อ 1 BTC
+            r[f"put_{lab}_mark_usd"] = round(mp, 1) if mp is not None else ""
         K_rule = put_at(spot - k_rule * sd); src = "rule" if K_rule else "none"
         if not K_rule and pk and pk[0] <= spot - 2.5 * sd:
             K_rule = pk[0]; src = "lowest_2.5SD"
@@ -183,8 +220,11 @@ def weekly_signal(chain, now):
         r["rule_source"] = src
         r["rule_sd_dist"] = round((spot - K_rule) / sd, 2) if K_rule else ""
         r["lowest_put"] = int(pk[0]) if pk else ""
-        mp = puts[K_rule]["mark_price"] if K_rule else None
-        r["rule_mark_usd"] = round(mp * spot, 1) if mp is not None else ""
+        mp = mark_usd(K_rule) if K_rule else None
+        r["rule_mark_usd"] = round(mp, 1) if mp is not None else ""
+        bd = bid_usd(K_rule) if K_rule else None
+        r["rule_bid_usd"] = round(bd, 1) if bd else ""
+        r["strike_source"] = strike_source
         r["rule_max_btc_4xC"] = round(CAP_X * C_USD / K_rule, 3) if K_rule else ""   # ก่อนหัก position ที่ถืออยู่
         rows.append(r)
     if not rows:
