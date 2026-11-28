@@ -1,0 +1,20 @@
+{
+ "updated_utc": "2026-11-28 08:27",
+ "date": "2026-11-28",
+ "time_utc": "08:27",
+ "bar_date": "2026-11-27",
+ "source": "binance_btcusdt",
+ "close": 59923.1,
+ "ret28_pct": -22.55,
+ "er28": 0.472,
+ "er_min": 0.3,
+ "rv30_pct": 46.2,
+ "vol_scale": 1.0,
+ "signal": "ON",
+ "direction": "SHORT",
+ "target_notional_usd": -2250.0,
+ "target_btc": -0.0375,
+ "c_usd": 15000,
+ "k": 0.15,
+ "rebalance_day": 0
+}
